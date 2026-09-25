@@ -14,23 +14,21 @@ const SCRIPT = resolve(__dirname, '../../python/rpc_server.py')
 // 自发现 Python 解释器（全程不硬编码任何本机盘符）：
 //   1) cordis.json 里 table 条目的 config.pythonBin（显式优先）
 //   2) 环境变量 PYTHON_BIN
-//   3) 扫描 PATH + 常见安装目录，挑第一个能 `import openpyxl` 的
-//   4) 兜底回退到 PATH 里的 python3 / python（让其自行报缺依赖，错误信息更明确）
+//   3) `py` 官方启动器 / PATH 里的 python（最常见、也最符合系统约定）
+//   4) **遍历所有就绪盘符**探测常见安装落点（Python3XX 根目录 + 用户级安装目录）
 // 换机 / 换系统 / 装到任意盘都能直接用，无需改代码。
-const WINDOWS_COMMON = [
-  'C:/Python314/python.exe',
-  'C:/Python313/python.exe',
-  'C:/Python312/python.exe',
-  'C:/Python311/python.exe',
-  'D:/Python314/python.exe',
-  'D:/Python313/python.exe',
-]
+//
+// 2026-09-25 修正：原实现把候选表写死成 C:/D: 上的几个标准落点，注释却声称
+// "不硬编码任何本机盘符"——**声称与实现对不上**：装到 F: 盘或用户级目录就一个都不命中，
+// 表现为"明明装了 Python 却找不到"。死根路径门禁报出 6 处即此因。
+// 现改为按盘符枚举 + 用户级目录探测，不再出现任何写死的绝对路径。
 const POSIX_COMMON = [
   '/usr/bin/python3',
   '/usr/local/bin/python3',
   '/opt/homebrew/bin/python3',
   '/usr/bin/python',
 ]
+const PY_VERSIONS_MAC = ['314', '313', '312', '311']
 
 function pathCandidates() {
   const out = []
@@ -49,19 +47,61 @@ function pathCandidates() {
   return out
 }
 
-function commonCandidates() {
-  if (process.platform === 'win32') {
-    const localApp = process.env.LOCALAPPDATA || ''
-    const extra = []
-    if (localApp) {
-      // Microsoft Store / 官方安装器常见落点
-      extra.push(resolve(localApp, 'Programs/Python/Python314/python.exe'))
-      extra.push(resolve(localApp, 'Programs/Python/Python313/python.exe'))
-      extra.push(resolve(localApp, 'Programs/Python/Python312/python.exe'))
-    }
-    return [...WINDOWS_COMMON, ...extra]
+// 枚举 Windows 上"当前就绪"的盘符，用于在各盘根目录探测 Python 安装。
+// 不写死任何盘符：只探测**实际存在**的盘，装机盘符变了也能命中。
+function driveLetters() {
+  if (process.platform !== 'win32') return []
+  const out = []
+  for (let c = 65; c <= 90; c++) {          // A..Z
+    const d = String.fromCharCode(c)
+    try {
+      // 探测根目录是否可访问（不存在的盘会抛错）
+      if (existsSync(d + ':/')) out.push(d)
+    } catch { /* ignore */ }
   }
-  return POSIX_COMMON
+  return out
+}
+
+// 项目级落点：放在系统级之前。理由：项目自带解释器（.venv）最能保证依赖齐备；
+// 而系统 PATH 里可能有一个装了 openpyxl 但版本/环境有问题的解释器（本机实测踩中）。
+function projectCandidates() {
+  if (process.platform !== 'win32') return []
+  return [
+    resolve(__dirname, '../../.venv/Scripts/python.exe'),
+    resolve(__dirname, '../../venv/Scripts/python.exe'),
+  ]
+}
+
+function commonCandidates() {
+  if (process.platform !== 'win32') {
+    const extra = []
+    for (const v of PY_VERSIONS_MAC) {
+      extra.push('/Library/Frameworks/Python.framework/Versions/3.' + v.slice(1) + '/bin/python3')
+    }
+    return [...POSIX_COMMON, ...extra]
+  }
+  const out = []
+  const localApp = process.env.LOCALAPPDATA || ''
+  const progFiles = [process.env.ProgramFiles, process.env['ProgramFiles(x86)']].filter(Boolean)
+  // ⓪ 项目级虚拟环境已由 projectCandidates() 单独前插，此处不再重复
+  // ① 用户级安装（官方安装器默认落点，与盘符无关）
+  const localRoot = localApp ? resolve(localApp, 'Programs/Python') : ''
+  // ② 系统级安装落点
+  const roots = [localRoot, ...progFiles.map((p) => resolve(p, 'Python'))].filter(Boolean)
+  for (const root of roots) {
+    for (const v of ['314', '313', '312', '311', '310']) {
+      out.push(resolve(root, 'Python' + v, 'python.exe'))
+    }
+    out.push(resolve(root, 'python.exe'))
+  }
+  // ③ 遍历所有就绪盘符的根目录（覆盖装在非系统盘的情况，如 F:\Python314）
+  for (const drive of driveLetters()) {
+    for (const v of ['314', '313', '312', '311', '310']) {
+      out.push(drive + ':/Python' + v + '/python.exe')
+    }
+    out.push(drive + ':/Python/python.exe')
+  }
+  return out
 }
 
 function canImportOpenpyxl(bin) {
@@ -77,13 +117,26 @@ export function resolvePythonBin(config) {
   if (config && config.pythonBin) return config.pythonBin
   if (process.env.PYTHON_BIN) return process.env.PYTHON_BIN
 
-  const candidates = [...pathCandidates(), ...commonCandidates(), 'python3', 'python']
+  // 优先级（2026-09-25 实测调整）：
+  //   ① 项目级 .venv —— 项目自带解释器，依赖最可控
+  //   ② `py -3` —— Windows 官方启动器（本机实测指向 3.13.14，无 CPython 相对导入崩溃 bug）
+  //   ③ PATH 里的 python —— 系统默认
+  //   ④ 系统级/盘符枚举的常见安装落点
+  // 原实现把 PATH 排在项目级之前，实测选到了 PATH 里那个有 bug 的 3.14.7。
+  const candidates = [
+    ...projectCandidates(),
+    'py -3',
+    ...pathCandidates(),
+    ...commonCandidates(),
+    'python3',
+    'python',
+  ]
   const seen = new Set()
   let firstExisting = null
   for (const c of candidates) {
     if (!c || seen.has(c)) continue
     seen.add(c)
-    // 裸命令名（python3/python）由操作系统 PATH 解析，直接探活
+    // 带参数的启动器（py -3）与裸命令名由操作系统解析，直接探活
     if (c.includes(sep) && !existsSync(c)) continue
     if (canImportOpenpyxl(c)) return c
     if (!firstExisting) firstExisting = c
