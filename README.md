@@ -35,6 +35,27 @@ Cordis 内核由 `npm install` 安装（`cordis` / `@cordisjs/plugin-loader` / `
 与 `package.json` 中声明的版本一致。`vendor/cordis-main/` 仅用于在本机保留一份框架源码镜像，
 **已被 `.gitignore` 排除，不随仓库分发**（第三方内核源码不入仓，见仓库卫生门禁）。
 
+## 表格能力三件套：本仓库是权威源
+
+`src/core/bridge.mjs` + `src/plugins/table.mjs` + `python/rpc_server.py` 合起来是"表格能力三件套"，
+**权威源在本仓库**（这里是超集：表格方法 + 地图/VTT 方法共用同一个 worker）。
+`pomodmer` 是消费者，用 `tools/sync-table-kit.mjs` 从这里同步过去并记录来源锁。
+
+改动这三件套时请注意：**别在消费方仓库里直接改**。曾经的教训是同一个
+"日期单元格杀死整个 Python worker"的缺陷在两个仓库里各自踩了一遍、各修一遍，
+UTF-8 那个坑同样是两边各修一次 —— 所以消费侧现在有 sha256 来源锁，手改会被 `check:kit` 当场拦下。
+
+本轮从 pomodmer 侧回流进来的加固（P1）：
+
+| 能力 | 说明 |
+|---|---|
+| 崩溃修复 | `json.dumps` 原在主循环 `try` 之外：`read_sheet` 撞上 datetime 单元格即 `TypeError` 掀翻循环、**进程退出**，此后所有调用都是 `python worker exited`。现在序列化在 `try` 内，并加 `_json_default`（datetime/date/time → ISO、timedelta → 秒、Decimal → float、bytes → base64） |
+| 原生类型写入 | `write_rows` 支持 `col_types`（`text`/`number`/`datetime`/`date`/`time`），把 ISO 串还原成 Excel 原生类型；解析失败原样写入，不为类型好看丢数据 |
+| 数字格式 / 冻结窗格 | `set_number_format`（一次多段区域）、`freeze_panes` |
+| 形态自检 | `sheet_meta`：冻结窗格 + 数字格式 + 值类型 + 合并区 + 批注（验证导出文件真实形态用） |
+| 启动器自发现 | `py -3` 这类"命令 + 参数"的解释器候选以前永远探活失败（整串加引号被当成程序名）；现在统一按 `pythonCommandParts` 拆词，probe 与 spawn 都能用 |
+| 探测 API | 新增 `probeTableWorker()`（带 memo 与超时预算），供宿主启动时判断"本机是否具备表格能力" |
+
 ## 运行
 
 ```bash

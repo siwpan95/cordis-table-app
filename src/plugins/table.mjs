@@ -2,7 +2,7 @@
 // 它是"构造器插件"：被 Cordis 实例化后通过 Service 基类提供 ctx.table；
 // 内部 spawn 一个 Python OpenPyXL worker（JsonRpcBridge），所有表格操作经 JSON-RPC 转发。
 import { Service } from 'cordis'
-import { JsonRpcBridge } from '../core/bridge.mjs'
+import { JsonRpcBridge, pythonCommandParts } from '../core/bridge.mjs'
 import { fileURLToPath } from 'node:url'
 import { dirname, resolve, sep } from 'node:path'
 import { existsSync } from 'node:fs'
@@ -104,45 +104,96 @@ function commonCandidates() {
   return out
 }
 
-function canImportOpenpyxl(bin) {
+function canImportOpenpyxl(bin, timeoutMs = 8000) {
+  // bin 可能是"带参数的命令"（Windows 官方启动器 py -3）：整串加引号会被 cmd 当成
+  // 一个不存在的程序名，必然探活失败（这正是这一条以前从未生效的原因）。
+  // 统一走 pythonCommandParts 拆词：字面路径原样、命令行拆出程序与前置参数。
+  const [cmd, ...preArgs] = pythonCommandParts(bin)
+  const line = [cmd, ...preArgs].map((s) => '"' + s + '"').join(' ')
   try {
-    execSync('"' + bin + '" -c "import openpyxl"', { stdio: 'ignore', timeout: 8000 })
+    execSync(line + ' -c "import openpyxl"', { stdio: 'ignore', timeout: timeoutMs })
     return true
   } catch {
     return false
   }
 }
 
-export function resolvePythonBin(config) {
-  if (config && config.pythonBin) return config.pythonBin
-  if (process.env.PYTHON_BIN) return process.env.PYTHON_BIN
-
-  // 优先级（2026-09-25 实测调整）：
-  //   ① 项目级 .venv —— 项目自带解释器，依赖最可控
-  //   ② `py -3` —— Windows 官方启动器（本机实测指向 3.13.14，无 CPython 相对导入崩溃 bug）
-  //   ③ PATH 里的 python —— 系统默认
-  //   ④ 系统级/盘符枚举的常见安装落点
-  // 原实现把 PATH 排在项目级之前，实测选到了 PATH 里那个有 bug 的 3.14.7。
-  const candidates = [
-    ...projectCandidates(),
-    'py -3',
-    ...pathCandidates(),
-    ...commonCandidates(),
-    'python3',
-    'python',
-  ]
+// 候选解释器（去重后保持优先级）：
+//   ① 项目自带 .venv/venv —— 依赖最可控（本机实测：PATH 里的解释器可能版本/环境有问题）
+//   ② py -3 官方启动器
+//   ③ PATH 里的 python
+//   ④ 用户级 / 系统级 / 各盘符下的常见安装落点
+function candidateList(config) {
+  const raw = []
+  if (config && config.pythonBin) raw.push(config.pythonBin)
+  if (process.env.PYTHON_BIN) raw.push(process.env.PYTHON_BIN)
+  raw.push(...projectCandidates(), 'py -3', ...pathCandidates(), ...commonCandidates(), 'python3', 'python')
   const seen = new Set()
-  let firstExisting = null
-  for (const c of candidates) {
-    if (!c || seen.has(c)) continue
+  return raw.filter((c) => {
+    if (!c || seen.has(c)) return false
     seen.add(c)
-    // 带参数的启动器（py -3）与裸命令名由操作系统解析，直接探活
-    if (c.includes(sep) && !existsSync(c)) continue
-    if (canImportOpenpyxl(c)) return c
-    if (!firstExisting) firstExisting = c
+    return true
+  })
+}
+
+// 探测结果 memo：一个进程内环境不会变，而每次探测都要 spawn 解释器（本机约 0.3s）。
+// 没有 memo 的话，"宿主启动时决定清单"和 TableService 构造会各探一遍，纯属白等。
+let probeMemo = { key: null, result: null }
+
+/**
+ * 探测本机表格能力：返回 { bin, openpyxl, anyBin }
+ *   - bin     能 `import openpyxl` 的解释器；null 表示没有
+ *   - anyBin  第一个"看起来存在"的解释器；用来区分"根本没装 Python"与"装了但缺 openpyxl"
+ *              （这两种情况给用户的提示完全不同，不能混为一谈）
+ *
+ * 显式指定（config.pythonBin / PYTHON_BIN）视为权威：只探它、不做跨解释器回退。
+ * 否则用户明明指定了某个解释器，却被悄悄换成另一个，排查起来极其费解。
+ *
+ * opts.timeoutMs 单个候选的探测上限；opts.budgetMs 整轮探测总预算（0=不限）。
+ * 宿主启动时的自动探测用较小预算：个别候选（如 Microsoft Store 的 python 占位程序）卡住时，
+ * 不能让"锦上添花"的能力探测把启动拖成好几秒 —— 探不到就安静退回纯表格之外的形态。
+ */
+export function probeTableWorker(config, opts = {}) {
+  const explicit = (config && config.pythonBin) || process.env.PYTHON_BIN || null
+  const key = explicit || '(auto)'
+  if (probeMemo.key === key && probeMemo.result && !opts.fresh) return probeMemo.result
+
+  const timeoutMs = opts.timeoutMs || 8000
+  const budgetMs = opts.budgetMs || 0
+  let result
+
+  if (explicit) {
+    result = { bin: explicit, openpyxl: canImportOpenpyxl(explicit, timeoutMs), anyBin: explicit }
+  } else {
+    const startedAt = Date.now()
+    let anyBin = null
+    let bin = null
+    for (const c of candidateList(config)) {
+      if (budgetMs && Date.now() - startedAt > budgetMs) break
+      const bare = !c.includes(sep)
+      // 带参数的启动器（py -3）与裸命令名由操作系统解析，绝对路径才做存在性检查
+      if (!bare && !existsSync(c)) continue
+      // anyBin 只认"确认存在"的绝对路径：否则在根本没装 Python 的机器上，
+      // 列表尾部的裸名 python3 会让提示误报成"装了 Python 但缺 openpyxl"，指错方向。
+      if (!anyBin && !bare) anyBin = c
+      if (canImportOpenpyxl(c, timeoutMs)) {
+        bin = c
+        break
+      }
+    }
+    result = { bin, openpyxl: !!bin, anyBin }
   }
-  // 没有任何一个带 openpyxl：回退到首个探活对象（让它去报缺依赖，错误信息更明确）
-  return firstExisting || 'python3'
+
+  probeMemo = { key, result }
+  return result
+}
+
+// TableService 用的解释器解析：优先能 `import openpyxl` 的；一个都没有时回退到首个
+// "看起来存在"的解释器或 'python3'，让"缺依赖"由 Python 自己报出来（错误信息更明确），
+// 而不是在这里变成一句"找不到 Python"。
+export function resolvePythonBin(config) {
+  const p = probeTableWorker(config)
+  return p.openpyxl ? p.bin : p.anyBin || 'python3'
 }
 
 export class TableService extends Service {
@@ -181,8 +232,14 @@ export class TableService extends Service {
   addSheet(path, name) {
     return this.bridge.call('add_sheet', { path, name })
   }
-  writeRows(path, sheet, startRow, startCol, rows) {
-    return this.bridge.call('write_rows', { path, sheet, start_row: startRow, start_col: startCol, rows })
+  // opts.colTypes：按列声明类型（'text' | 'number' | 'datetime' | 'date' | 'time'），
+  // 让 worker 把 ISO 字符串还原成 Excel 原生类型 —— 日期要能排序/筛选/算日期就必须走这条。
+  // JS 侧写 camelCase，过桥时统一翻成 worker 的 snake_case（协议那侧只有 snake_case）。
+  writeRows(path, sheet, startRow, startCol, rows, opts = {}) {
+    const { colTypes, ...rest } = opts
+    return this.bridge.call('write_rows', {
+      path, sheet, start_row: startRow, start_col: startCol, rows, col_types: colTypes, ...rest,
+    })
   }
   writeCell(path, sheet, row, col, value) {
     return this.bridge.call('write_cell', { path, sheet, row, col, value })
@@ -192,6 +249,17 @@ export class TableService extends Service {
   }
   setColumnWidth(path, sheet, col, width) {
     return this.bridge.call('set_column_width', { path, sheet, col, width })
+  }
+  // items: [{ range: 'A2:A8', format: 'yyyy-mm-dd' }, ...]
+  setNumberFormat(path, sheet, items) {
+    return this.bridge.call('set_number_format', { path, sheet, items })
+  }
+  freezePanes(path, sheet, cell) {
+    return this.bridge.call('freeze_panes', { path, sheet, cell })
+  }
+  // 读工作表元信息（冻结窗格 / 数字格式 / 值类型）：给"验证导出文件真实形态"用
+  sheetMeta(path, sheet, row) {
+    return this.bridge.call('sheet_meta', { path, sheet, row })
   }
   readSheet(path, sheet) {
     return this.bridge.call('read_sheet', { path, sheet })

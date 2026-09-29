@@ -24,9 +24,12 @@ import sys
 import os
 import io
 import json
+import base64
+import random
+import decimal
+import datetime
 import traceback
 import contextlib
-import random
 
 from openpyxl import Workbook, load_workbook
 from openpyxl.utils import get_column_letter
@@ -39,18 +42,80 @@ def _setup_stdio_utf8():
 
     中文 Windows 控制台的 Python 默认 stdio 编码是 GBK(cp936)：本进程用
     ensure_ascii=False 写一行一 JSON-RPC（见 main），非 ASCII 字符会被编成
-    GBK 字节，而 Node 侧 readline 按 UTF-8 解码，得到孤立代理项（如 \\udc8c），
+    GBK 字节，而 Node 侧 readline 按 UTF-8 解码，得到孤立代理项，
     于是 openpyxl/lxml 落盘时报 `UnicodeEncodeError: surrogates not allowed`。
     显式 reconfigure 后协议两端都是 UTF-8，跨机器（含 Windows）行为一致。
+
+    三个流的容错策略不同：
+      stdin  = replace          收到坏字节退化成 U+FFFD，json 解析失败后跳过该行，别掀翻主循环；
+      stdout = strict           协议通道，宁可明确报错，也不往协议里写坏数据；
+      stderr = backslashreplace 日志是排障通道，任何怪字符都不该让日志本身崩掉。
     """
-    for stream in (sys.stdin, sys.stdout, sys.stderr):
+    for stream, errors in (
+        (sys.stdin, "replace"),
+        (sys.stdout, "strict"),
+        (sys.stderr, "backslashreplace"),
+    ):
         try:
-            stream.reconfigure(encoding="utf-8", errors="replace")
+            stream.reconfigure(encoding="utf-8", errors=errors)
         except Exception:
             pass  # 流被重定向成不支持 reconfigure 的对象时保持原样
 
 
 WORKBOOKS = {}  # path -> Workbook
+
+
+def _json_default(o):
+    """把 openpyxl 单元格里的非 JSON 原生类型转成 JSON 安全表示。
+
+    read_sheet / read_map 直接吐单元格原始值，而 Excel 里的日期是 datetime/date/time 对象、
+    时间差是 timedelta、高精度数字可能是 Decimal、二进制是 bytes —— json.dumps 一个都不认。
+    这里统一成 ISO 8601 字符串 / 数字，宿主拿到的就是"确定能过 JSON"的东西。
+    （真实缺陷：一个日期单元格就能让 json.dumps 抛 TypeError；那时序列化还在 try 之外，
+      整个 worker 进程被带走，此后所有调用都变成 "python worker exited"。）
+    """
+    if isinstance(o, (datetime.datetime, datetime.date, datetime.time)):
+        return o.isoformat()
+    if isinstance(o, datetime.timedelta):
+        return o.total_seconds()
+    if isinstance(o, decimal.Decimal):
+        return float(o)
+    if isinstance(o, (bytes, bytearray)):
+        return base64.b64encode(bytes(o)).decode("ascii")
+    return str(o)
+
+
+def _coerce(val, ctype):
+    """按列声明的类型，把宿主传来的值还原成 Excel 原生类型。
+
+    宿主与 worker 之间只有 JSON，日期必然是字符串；要让 Excel 里的日期能排序/筛选/做日期计算，
+    就得在这里变回 datetime。只做"能确定"的转换：解析失败原样写入，绝不为了类型好看丢数据。
+    """
+    if val is None or val == "" or not ctype:
+        return val
+    if ctype in ("datetime", "date", "time"):
+        if not isinstance(val, str):
+            return val
+        try:
+            dt = datetime.datetime.fromisoformat(val.replace("Z", "+00:00"))
+        except ValueError:
+            return val
+        if ctype == "date":
+            return dt.date()
+        if ctype == "time":
+            return dt.time()
+        return dt
+    if ctype == "number":
+        if isinstance(val, (int, float)):
+            return val
+        try:
+            text = str(val).strip()
+            return float(text) if ("." in text or "e" in text.lower()) else int(text)
+        except (TypeError, ValueError):
+            return val
+    if ctype == "text":
+        return str(val)
+    return val
 
 
 # --------------------------------------------------------------------------- #
@@ -251,9 +316,12 @@ def handle(method, params):
         start_row = int(p.get("start_row", 1))
         start_col = int(p.get("start_col", 1))
         rows = p.get("rows", [])
+        # 可选：按列声明类型（text/number/datetime/date/time），把 ISO 字符串还原成 Excel 原生类型
+        col_types = p.get("col_types") or []
         for i, row in enumerate(rows):
             for j, val in enumerate(row):
-                ws.cell(row=start_row + i, column=start_col + j, value=val)
+                ctype = col_types[j] if j < len(col_types) else None
+                ws.cell(row=start_row + i, column=start_col + j, value=_coerce(val, ctype))
         return {"ok": True, "rows": len(rows)}
 
     if method == "write_cell":
@@ -287,6 +355,58 @@ def handle(method, params):
         col = int(p["col"])
         ws.column_dimensions[get_column_letter(col)].width = float(p.get("width", 15))
         return {"ok": True}
+
+    # 数字格式：一次调用可带多段区域，避免宿主为"日期列 / 时长列"来回几十次往返
+    # items: [{ "range": "A2:A8", "format": "yyyy-mm-dd" }, ...]
+    if method == "set_number_format":
+        wb = _get_wb(path)
+        ws = _sheet(wb, p.get("sheet"))
+        items = p.get("items") or []
+        applied = 0
+        for it in items:
+            rng = it.get("range")
+            if not rng:
+                continue
+            fmt = it.get("format") or "General"
+            # ws["B2"] 给单个 Cell，ws["A2:A8"] 给 tuple of tuple —— 前者不可迭代，先归一成列表
+            target = ws[rng]
+            if isinstance(target, tuple):
+                cells = [c for row in target for c in (row if isinstance(row, tuple) else (row,))]
+            else:
+                cells = [target]
+            for cell in cells:
+                cell.number_format = fmt
+            applied += 1
+        return {"ok": True, "applied": applied}
+
+    # 冻结窗格（表头常驻）：cell 形如 "A2" 表示冻结首行
+    if method == "freeze_panes":
+        wb = _get_wb(path)
+        ws = _sheet(wb, p.get("sheet"))
+        ws.freeze_panes = p.get("cell") or None
+        return {"ok": True, "freeze_panes": ws.freeze_panes}
+
+    # 工作表元信息：给宿主/测试一个"能验证文件真实形态"的读口
+    # （日期到底是真日期还是文本、表头冻没冻、单元格是什么格式、合并区与批注在不在 ——
+    #  光看 read_sheet 只能拿到值，这些一律看不出来）
+    if method == "sheet_meta":
+        wb = _get_wb(path)
+        ws = _sheet(wb, p.get("sheet"))
+        row = int(p.get("row", 2))
+        cols = range(1, ws.max_column + 1)
+        return {
+            "title": ws.title,
+            "sheets": list(wb.sheetnames),
+            "max_row": ws.max_row,
+            "max_col": ws.max_column,
+            "freeze_panes": ws.freeze_panes,
+            "number_formats": [ws.cell(row=row, column=c).number_format for c in cols],
+            "value_types": [type(ws.cell(row=row, column=c).value).__name__ for c in cols],
+            "merged": sorted(str(r) for r in ws.merged_cells.ranges),
+            "comments": sorted(
+                c.coordinate for r in ws.iter_rows() for c in r if c.comment is not None
+            ),
+        }
 
     if method == "read_sheet":
         wb = _get_wb(path)
@@ -855,17 +975,23 @@ def main():
         msgid = req.get("id")
         method = req.get("method")
         params = req.get("params")
+        # 序列化也必须在 try 里：json.dumps 会因为单元格里的 datetime/Decimal 抛 TypeError，
+        # 一旦漏在 try 外，异常会掀翻整个 for 循环并带走进程 ——
+        # 一个坏单元格 = 表格能力全废（宿主后续所有调用都变成 "python worker exited"）。
         try:
             with contextlib.redirect_stdout(sys.stderr):
                 result = handle(method, params)
             resp = {"jsonrpc": "2.0", "id": msgid, "result": result}
+            payload = json.dumps(resp, ensure_ascii=False, default=_json_default)
         except Exception as e:
             resp = {
                 "jsonrpc": "2.0",
                 "id": msgid,
                 "error": {"code": -32000, "message": str(e), "data": traceback.format_exc()},
             }
-        sys.stdout.write(json.dumps(resp, ensure_ascii=False) + "\n")
+            # 到这里再炸就真没办法了（连错误都编不成 JSON），但也不能静默丢响应
+            payload = json.dumps(resp, ensure_ascii=False, default=_json_default)
+        sys.stdout.write(payload + "\n")
         sys.stdout.flush()
 
 
