@@ -14,8 +14,9 @@
     "map:dj": "node src/map_dj.mjs",
     "map:export": "node src/map_cli.mjs export",
     "map:import": "node src/map_cli.mjs import",
-    "test": "node src/_smoke.mjs && node src/_smoke_bridge.mjs && node src/map_demo.mjs && node src/map_gen.mjs && node src/map_dj.mjs",
-    "smoke:bridge": "node src/_smoke_bridge.mjs"
+    "test": "node src/_smoke.mjs && node src/_smoke_bridge.mjs && node src/_smoke_chart.mjs && node src/map_demo.mjs && node src/map_gen.mjs && node src/map_dj.mjs",
+    "smoke:bridge": "node src/_smoke_bridge.mjs",
+    "smoke:chart": "node src/_smoke_chart.mjs"
   },
   "keywords": [],
   "author": "siwpan",
