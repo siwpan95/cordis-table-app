@@ -1,5 +1,12 @@
 # Cordis 表格小应用（Cordis 内核 + OpenPyXL）
 
+## 仓库角色定位（投资组合分级 ①）
+
+> 本仓在 siwpan 投资组合（D:/projects/repos，共 133 仓）中定级为 **① 核心推进**，领域 **游戏引擎/框架**，定位 **引擎平台层**。
+> **角色**：Cordis+OpenPyXL 表格应用内核，随 cordis 维护。
+> **维护策略**：① 核心推进——持续投入、不允许冻结；随所属收敛点 / 流水线长期演进。
+> 投资组合统一分级索引：`D:/projects/repos/PORTFOLIO_TIERING.md`。
+
 基于 **Cordis（Node.js 插件框架）作为应用内核**，
 表格能力交给 **Python + OpenPyXL**，两者通过 **JSON-RPC stdio 桥** 连接。
 
